@@ -1,7 +1,0 @@
-__pycache__/
-*.pyc
-*.pyo
-.ipynb_checkpoints/
-cosmic_main/models/
-cosmic_main/results/
-cosmic_main/dataset/
