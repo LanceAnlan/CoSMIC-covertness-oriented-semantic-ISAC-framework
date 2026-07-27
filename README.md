@@ -18,7 +18,7 @@
   <a href="#citation">Citation</a>
 </p>
 
-Official implementation of the paper **“Hiding Semantics in ISAC: Covert Communication over Dual-Functional Waveforms with Rectified Flow Assisted Recovery”**.
+Official implementation of the paper **“Covert Semantic Transmission in ISAC: Dual-Functional Waveform Design and Rectified Flow-Assisted Recovery”**.
 
 ---
 
@@ -26,7 +26,7 @@ Official implementation of the paper **“Hiding Semantics in ISAC: Covert Commu
 
 Semantic transmission over integrated sensing and communication (ISAC) is a promising paradigm for efficient and intelligent connectivity in future wireless networks. However, the open nature of the wireless channel exposes the dual-functional waveform to warden detection, which makes the *joint* guarantee of **covertness**, **sensing fidelity**, and **semantic accuracy** a fundamental challenge.
 
-**CoSMIC** (**Co**vertness-oriented **S**e**M**antic **ISAC**) hides an entire semantic transmission inside an ordinary sensing waveform: the sensing output of each frame is embedded into the next frame's dual-functional chirp through semantic modulation, so that the radiated signal remains statistically indistinguishable from a sensing-only probe. The framework consists of:
+**CoSMIC** (**C**vertness-**o**riented **S**emantic **M**odulation in **I**SAC **C**hirps) hides an entire semantic transmission inside an ordinary sensing waveform: the sensing output of each frame is embedded into the next frame's dual-functional chirp through semantic modulation, so that the radiated signal remains statistically indistinguishable from a sensing-only probe. The framework consists of:
 
 - **Semantic rotation coding** — semantic latents are mapped onto the pairwise *rotation* and *scaling* of shared Gaussian reference sequences, keeping the transmit waveform constant-modulus in both modes.
 - **Closed-form covertness guarantee** — a derived per-frame Kullback–Leibler bound is enforced *by construction* through a differentiable budget projection, valid against arbitrary detectors including learning-based ones.
@@ -148,6 +148,10 @@ Closed-loop reception at Bob on the [View-of-Delft dataset](https://github.com/t
   <img src="assets/sequence3.gif" width="88%" alt="Demo sequence 3 — Cyclist">
 </p>
 
+<p align="center">
+  <img src="assets/sequence4.gif" width="88%" alt="Demo sequence 4 — Multiple targets">
+</p>
+
 ---
 
 ## Getting Started
@@ -174,7 +178,7 @@ If you find this work useful, please cite:
 
 ```bibtex
 @article{bai2026cosmic,
-  title   = {Hiding Semantics in {ISAC}: Covert Communication over Dual-Functional Waveforms with Rectified Flow Assisted Recovery},
+  title   = {Covert Semantic Transmission in {ISAC}: Dual-Functional Waveform Design and Rectified Flow-Assisted Recovery},
   author  = {Bai, Yunfan and Qian, Yuwen and Zeng, Cheng and Yang, Zhaohui and Shi, Long and Shu, Feng and Zhang, Shuning and Li, Jun},
   journal = {Under review},
   year    = {2026}
