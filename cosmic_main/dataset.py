@@ -20,8 +20,7 @@ from torch.utils.data import Dataset
 from utils import crop_bbox_xyxy, fit_to_canvas_keep_ar, normalize_meta, safe_arctan2
 
 
-# VoD object classes (DontCare excluded), ordered by frequency. The index order
-# is stored in the checkpoint, so don't reorder without retraining.
+# VoD object classes (DontCare excluded), ordered by frequency. The index order is stored in the checkpoint, so don't reorder without retraining.
 VOD_DEFAULT_CLASSES: List[str] = [
     "Pedestrian",
     "Car",
