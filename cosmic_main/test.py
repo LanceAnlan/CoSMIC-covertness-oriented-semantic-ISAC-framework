@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 # Test: PSNR / SSIM / sensing RMSE (+ cls acc) at each requested SNR.
-# Optionally saves a few closed-loop demo sequences as png + gif.
 
 from __future__ import annotations
 
