@@ -180,7 +180,7 @@ If you find this work useful, please cite:
 @article{bai2026cosmic,
   title   = {Covert Semantic Transmission in {ISAC}: Dual-Functional Waveform Design and Rectified Flow-Assisted Recovery},
   author  = {Bai, Yunfan and Qian, Yuwen and Zeng, Cheng and Yang, Zhaohui and Shi, Long and Shu, Feng and Zhang, Shuning and Li, Jun},
-  journal = {Under review},
+  journal = {},
   year    = {2026}
 }
 ```
