@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/PyTorch-2.x-EE4C2C?logo=pytorch&logoColor=white" alt="PyTorch">
   <img src="https://img.shields.io/badge/Dataset-View--of--Delft-2E8B57" alt="Dataset">
-  <img src="https://img.shields.io/badge/Status-Under%20Review-orange" alt="Status">
+  <img src="https://img.shields.io/badge/Status-Paper%20Submitted-orange" alt="Status">
 </p>
 
 <p align="center">
