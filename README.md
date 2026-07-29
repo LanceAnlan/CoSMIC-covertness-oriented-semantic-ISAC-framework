@@ -3,13 +3,16 @@
 <h3 align="center">Covert Communication over Dual-Functional Waveforms<br>with Rectified Flow-Assisted Recovery</h3>
 
 <p align="center">
+  <a href="https://arxiv.org/abs/2607.25354">
+    <img src="https://img.shields.io/badge/Paper-arXiv%3A2607.25354-B31B1B?logo=arxiv&logoColor=white" alt="arXiv Paper">
+  </a>
   <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/PyTorch-2.x-EE4C2C?logo=pytorch&logoColor=white" alt="PyTorch">
   <img src="https://img.shields.io/badge/Dataset-View--of--Delft-2E8B57" alt="Dataset">
-  <img src="https://img.shields.io/badge/Status-Paper%20Submitted-orange" alt="Status">
 </p>
 
 <p align="center">
+  <a href="https://arxiv.org/abs/2607.25354">Paper</a> •
   <a href="#overview">Overview</a> •
   <a href="#system-model">System Model</a> •
   <a href="#cosmic-network">CoSMIC Network</a> •
