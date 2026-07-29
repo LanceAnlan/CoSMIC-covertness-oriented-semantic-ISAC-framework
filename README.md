@@ -178,9 +178,12 @@ If you find this work useful, please cite:
 
 ```bibtex
 @article{bai2026cosmic,
-  title   = {Covert Semantic Transmission in {ISAC}: Dual-Functional Waveform Design and Rectified Flow-Assisted Recovery},
-  author  = {Bai, Yunfan and Qian, Yuwen and Zeng, Cheng and Yang, Zhaohui and Shi, Long and Shu, Feng and Zhang, Shuning and Li, Jun},
-  journal = {},
+  author  = {Yunfan Bai and Yuwen Qian and Cheng Zeng and Zhen Mei and
+             Zhaohui Yang and Wei Zhu and Shuning Zhang and Feng Shu},
+  title   = {Covert Semantic Transmission in {ISAC}: Dual-Functional Waveform
+             Design and Rectified Flow-Assisted Recovery},
+  journal = {arXiv preprint arXiv:2607.25354},
+  month   = jul,
   year    = {2026}
 }
 ```
