@@ -1,6 +1,6 @@
 <h1 align="center">CoSMIC: Hiding Semantics in ISAC</h1>
 
-<h3 align="center">Covert Communication over Dual-Functional Waveforms<br>with Rectified Flow Assisted Recovery</h3>
+<h3 align="center">Covert Communication over Dual-Functional Waveforms<br>with Rectified Flow-Assisted Recovery</h3>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python">
@@ -18,7 +18,8 @@
   <a href="#citation">Citation</a>
 </p>
 
-Official implementation of the paper **“Covert Semantic Transmission in ISAC: Dual-Functional Waveform Design and Rectified Flow-Assisted Recovery”**.
+Official implementation of the paper
+[**“Covert Semantic Transmission in ISAC: Dual-Functional Waveform Design and Rectified Flow-Assisted Recovery”**](https://arxiv.org/abs/2607.25354).
 
 ---
 
