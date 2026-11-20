@@ -26,16 +26,14 @@ Official implementation of the paper
 
 ## Overview
 
-Semantic transmission over integrated sensing and communication (ISAC) is a promising paradigm for efficient and intelligent connectivity in future wireless networks. However, the open nature of the wireless channel exposes the dual-functional waveform to warden detection, which makes the *joint* guarantee of **covertness**, **sensing fidelity**, and **semantic accuracy** a fundamental challenge.
+**CoSMIC** (**C**overtness-**o**riented **S**emantic **M**odulation in **I**SAC **C**hirps) hides a semantic transmission inside an ordinary sensing waveform and jointly addresses **covertness**, **sensing fidelity**, and **semantic accuracy**. The sensing output of each frame is embedded into the dual-functional chirp of the next frame, and the radiated signal remains statistically indistinguishable from a sensing-only probe.
 
-**CoSMIC** (**C**vertness-**o**riented **S**emantic **M**odulation in **I**SAC **C**hirps) hides an entire semantic transmission inside an ordinary sensing waveform: the sensing output of each frame is embedded into the next frame's dual-functional chirp through semantic modulation, so that the radiated signal remains statistically indistinguishable from a sensing-only probe. The framework consists of:
+- **Semantic rotation coding.** Semantic latents are mapped onto the pairwise rotation and scaling of shared Gaussian reference pairs under a constant-modulus waveform.
+- **Multi-frame covertness guarantee.** A closed-form Kullback–Leibler bound over an arbitrary observation window is enforced by a differentiable budget projection.
+- **Sensing performance preservation.** The matched-filter mainlobe response stays invariant and the output SINR stays bounded under the semantic embedding.
+- **Reliability-guided RFlow refiner.** A rectified flow on the unit circle transports the coarse latent toward the clean latent within two steps.
 
-- **Semantic rotation coding** — semantic latents are mapped onto the pairwise *rotation* and *scaling* of shared Gaussian reference sequences, keeping the transmit waveform constant-modulus in both modes.
-- **Closed-form covertness guarantee** — a derived per-frame Kullback–Leibler bound is enforced *by construction* through a differentiable budget projection, valid against arbitrary detectors including learning-based ones.
-- **Sensing performance preservation** — the radar performance under semantic embedding is analyzed in the paper.
-- **Reliability-guided rectified flow (RFlow) refiner** — a few-step flow refiner at the receiver transports the coarse demodulated latent toward the clean latent under the guidance of reliability features.
-
-On the [View-of-Delft automotive dataset](https://github.com/tudelft-iv/view-of-delft-dataset), CoSMIC improves semantic reconstruction quality by about **20%** over diffusion-aided baselines with substantially reduced inference latency, while keeping the warden's detection performance at the level of random guessing under strict covertness budgets.
+On the [View-of-Delft automotive dataset](https://github.com/tudelft-iv/view-of-delft-dataset), CoSMIC improves the semantic reconstruction quality by up to **18%** over diffusion-based baselines under strict covertness constraints.
 
 ---
 
@@ -47,17 +45,17 @@ On the [View-of-Delft automotive dataset](https://github.com/tudelft-iv/view-of-
 
 CoSMIC operates on a frame basis with three parties.
 
-**Alice** (dual-functional transmitter) probes the scene with a chirp-based ISAC waveform and estimates the target range, velocity, angle, and class from the echoes via matched filtering. Together with the scene image, the estimates form the sensing output $\mathbf{o}_{k-1}$, which becomes the semantic message of the next frame,
+- **Alice** (dual-functional transmitter) probes the scene with a chirp-based ISAC waveform and estimates the target range, velocity, angle, and class from the echoes.
+- **Bob** (legitimate receiver) shares a secret seed with Alice and recovers the scene image and the target states from the waveform.
+- **Willie** (warden) tests the sensing-only mode $H_0$ against the covert SemCom mode $H_1$ over a window of frames with an arbitrary detector.
 
-$$
-\mathbf{m}_k=\Phi\left(\mathbf{o}_{k-1}\right)=\left[\mathbf{i}_k,\boldsymbol{\eta}_k\right],
-$$
+The sensing output $`\mathbf{o}_{k-1}`$ of one frame forms the semantic message of the next frame,
 
-embedded into the phase of the *same* constant-modulus chirp that performs the sensing.
+```math
+\mathbf{m}_k=\Phi\left(\mathbf{o}_{k-1}\right)=\left[\mathbf{i}_k,\boldsymbol{\varsigma}_k\right],
+```
 
-**Bob** (legitimate receiver) shares the pseudo-random reference seed with Alice, demodulates the waveform, and recovers the scene image and target states.
-
-**Willie** (warden) runs a binary hypothesis test between the sensing-only mode $H_0$ and the covert semantic mode $H_1$ with a learning-based classifier. Since any detector is lower-bounded by the optimal likelihood ratio test, the covertness guarantee below applies to arbitrary detector structures, and the total detection error $\xi_k = P_{f,k}+P_{m,k}$ stays near that of random guessing.
+where $`\mathbf{i}_k`$ is the scene image and $`\boldsymbol{\varsigma}_k`$ stacks the target range, velocity, angle, and class.
 
 ---
 
@@ -67,70 +65,67 @@ embedded into the phase of the *same* constant-modulus chirp that performs the s
   <img src="assets/network.png" width="97%" alt="CoSMIC network architecture">
 </p>
 
-### Transmitter — covert dual-functional waveform generation
+### Transmitter: covert dual-functional waveform generation
 
-Each frame provides $D=MN$ real degrees of freedom, organized as $J=D/2$ Gaussian reference pairs $\mathbf{q}_{k,j}\sim\mathcal{N}(\mathbf{0},\mathbf{I}_2)$ generated from the seed shared with Bob. A ConvNeXt encoder with meta-slot injection maps $\mathbf{m}_k$ to per-pair rotation directions and scales, and the semantics are written into a block-diagonal rotation of the reference vector:
+Each frame of $M$ chirps with $N$ samples per chirp carries $J=MN/2$ Gaussian reference pairs $`\mathbf{q}_{k,j}\sim\mathcal{N}(\mathbf{0},\mathbf{I}_2)`$ expanded frame by frame from the secret seed. The semantic encoder maps $`\mathbf{m}_k`$ to the pair parameters $`(c_{k,j},s_{k,j})`$, which rotate the reference vector as
 
-$$
+```math
 \mathbf{b}_k^{(0)}=\mathbf{q}_k,\qquad
 \mathbf{b}_k^{(1)}=\mathbf{A}_k\mathbf{q}_k,\qquad
 \mathbf{A}_{k,j}=\begin{bmatrix}c_{k,j} & -s_{k,j}\\ s_{k,j} & c_{k,j}\end{bmatrix},
-$$
+```
 
-where mode $0$ is the sensing-only probe and mode $1$ carries the covert semantics through the rotation angles and the pair scales $\tau_{k,j}=c_{k,j}^{2}+s_{k,j}^{2}$.
+where mode $0$ is the sensing-only probe, mode $1$ is the covert SemCom mode, and $`\tau_{k,j}=c_{k,j}^{2}+s_{k,j}^{2}`$ is the pair scale.
 
-**Covertness guarantee.** With $\chi(t)=t-\ln t-1$, the frame-level KL divergence observed by Willie is bounded in closed form by the pair scales only:
+**Multi-frame covertness constraint.** With $\chi(t)=t-\ln t-1$, the joint distributions $`P_{0}^{(K)}`$ and $`P_{1}^{(K)}`$ of the observations at Willie over an arbitrary window of $K$ consecutive frames satisfy
 
-$$
-D\left(P_{1,k}\|P_{0,k}\right)\le\sum_{j=1}^{J}\chi(\tau_{k,j}),
-$$
+```math
+D\left(P_{1}^{(K)}\,\middle\Vert\,P_{0}^{(K)}\right)\le\mathbb{E}\left[\sum_{k=1}^{K}\sum_{j=1}^{J}\chi(\tau_{k,j})\right],
+\qquad
+\sum_{k=1}^{K}\sum_{j=1}^{J}\chi(\tau_{k,j})\le 2\epsilon^{2}
+\;\Longrightarrow\;
+\xi^{(K)}\ge 1-\epsilon,
+```
 
-and enforcing the budget
+where $`\xi^{(K)}`$ is the total detection error probability of Willie. The rotation angles are absent from the bound and carry the semantics free of covertness cost.
 
-$$
-\sum_{j=1}^{J}\chi(\tau_{k,j})\le 2\epsilon^{2}
-\quad\Longrightarrow\quad
-\xi_k\ge 1-\epsilon
-$$
+**Covert projection.** The budget $2\epsilon^{2}$ is allocated evenly over a monitoring window of $`K_{\mathrm{W}}`$ frames, and each frame meets its share by contracting the raw scales $`\tilde{\tau}_{k,j}`$ toward unity,
 
-keeps the optimal detection error of *any* warden within $\epsilon$ of random guessing. The rotation angles do not appear in the bound — they are free to carry semantics — while the scales consume the covert budget. The budget is met **by construction** through a differentiable projection that contracts the raw scales toward unity,
-
-$$
+```math
 \tau_{k,j}=1+\lambda_k(\tilde{\tau}_{k,j}-1),\qquad
-\lambda_k=\sup\lbrace\lambda\in[0,1]:F_k(\lambda)\le 2\epsilon^{2}\rbrace,
-$$
+\lambda_k=\sup\left\lbrace\lambda\in[0,1]:\sum_{j=1}^{J}\chi\left(1+\lambda(\tilde{\tau}_{k,j}-1)\right)\le\frac{2\epsilon^{2}}{K_{\mathrm{W}}}\right\rbrace,
+```
 
-where $F_k(\lambda)=\sum_{j}\chi(1+\lambda(\tilde{\tau}_{k,j}-1))$ is solved by a fast bisection inside the forward pass.
+where $`\lambda_k`$ is found by bisection and treated as a constant in the backward pass.
 
-**Waveform synthesis.** The (rotated) symbol vector is shaped by an invertible autoregressive matrix and phase-modulated onto the chirp basis $p_n=\exp\left(j\pi\mu n^{2}/N\right)$:
+**Waveform synthesis.** The symbol vector is shaped, mapped to phases, and modulated onto the chirp $`p_n=\exp\left(j\pi\mu n^{2}/N\right)`$,
 
-$$
+```math
 \mathbf{u}_k^{(i)}=\mathbf{G}_{\rho}\mathbf{b}_k^{(i)},\qquad
 \phi_{k,m,n}^{(i)}=\pi\tanh\left(\alpha_{\phi}u_{k,m,n}^{(i)}\right),\qquad
 x_{k,m,n}^{(i)}=p_n\,e^{j\phi_{k,m,n}^{(i)}},
-$$
-
-so $|x_{k,m,n}^{(i)}|=1$ in both modes: the waveform keeps a constant envelope and an identical radiated power whether or not semantics are present. The radar performance under the semantic embedding is analyzed in the paper.
-
-### Receiver — reliability-guided RFlow refiner
-
-Bob inverts the transmit chain step by step: MMSE equalization, chirp removal, a MAP inversion of the $\tanh$ phase map, inverse autoregressive shaping, and a pairwise least-squares projection onto the shared reference pairs. This yields a **coarse latent** $\mathbf{z}_k^{(0)}$ (normalized pair directions) together with **reliability features** $\mathbf{r}_k$ built from the reference-pair energy, the estimated pair magnitude, a receive-SNR proxy, and the phase residual.
-
-The coarse-latent distortion is signal-dependent and directional — it stems from fading equalization error, the nonlinear phase inversion, and the covert scale contraction — so an isotropic Gaussian denoiser would disturb the angular structure that carries the semantics. Instead, a rectified-flow refiner transports the coarse latent toward the clean latent $\mathbf{z}_k^{\star}$ along the linear bridge
-
-$$
-\mathbf{z}_{k,t}=(1-t)\,\mathbf{z}_k^{(0)}+t\,\mathbf{z}_k^{\star},\qquad t\in[0,1],
-$$
-
-with a velocity network $`\mathbf{v}_{\Gamma}(\mathbf{z}_{k,t},t,\mathbf{r}_k)`$ trained by flow matching against the constant residual velocity $\mathbf{z}_k^{\star}-\mathbf{z}_k^{(0)}$. Conditioning on $\mathbf{r}_k$ provably never increases the attainable refinement error. At inference, only $Q$ explicit steps are integrated, each followed by a per-pair projection $\mathcal{P}$ back onto the unit circle:
-
-```math
-\mathbf{z}_k^{(q+1)}=\mathcal{P}\left(\mathbf{z}_k^{(q)}+\frac{1}{Q}\,\mathbf{v}_{\Gamma}\left(\mathbf{z}_k^{(q)},\frac{q}{Q},\mathbf{r}_k\right)\right),\qquad q=0,\ldots,Q-1,
 ```
 
-and $Q=2$ already suffices — this is what gives CoSMIC its low inference latency compared with iterative diffusion samplers. The refined latent and the reliability features are finally decoded by a two-branch semantic decoder into the scene image and the target range / velocity / angle / class.
+which keeps a constant envelope and identical radiated power in both modes.
 
-The full implementation of the transmitter, channel, receiver, and radar processing lives in [`cosmic_main/`](cosmic_main).
+### Receiver: reliability-guided RFlow refiner
+
+Bob equalizes the received frame, inverts the phase mapping and the shaping, and projects onto the shared reference pairs, which yields the coarse pair angles $`\boldsymbol{\theta}_k^{(0)}`$ and the reliability features $`\mathbf{r}_k`$. The pair angles live on the torus $`\mathbb{T}^{J}=(\mathcal{S}^{1})^{J}`$ with $`\mathrm{Log}_{a}(b)=\mathrm{w}(b-a)`$ and $`\mathrm{Exp}_{a}(v)=\mathrm{w}(a+v)`$, where $\mathrm{w}(\cdot)$ wraps an angle into $[-\pi,\pi)$. The RFlow refiner transports the coarse angles toward the clean angles $`\boldsymbol{\theta}_k^{\star}`$ along the geodesic bridge
+
+```math
+\boldsymbol{\theta}_{k,t}=\mathrm{Exp}_{\boldsymbol{\theta}_k^{(0)}}\left(t\,\boldsymbol{\Delta}_k\right),\qquad
+\boldsymbol{\Delta}_k=\mathrm{Log}_{\boldsymbol{\theta}_k^{(0)}}\left(\boldsymbol{\theta}_k^{\star}\right),\qquad t\in[0,1],
+```
+
+and a velocity field $`\mathbf{v}_{\Psi}`$ conditioned on $`\mathbf{r}_k`$ is trained by flow matching toward the constant velocity $`\boldsymbol{\Delta}_k`$. At inference, $Q$ explicit steps are taken on the torus,
+
+```math
+\boldsymbol{\theta}_k^{(q+1)}=\mathrm{Exp}_{\boldsymbol{\theta}_k^{(q)}}\left(\frac{1}{Q}\,\mathbf{v}_{\Psi}\left(\boldsymbol{\theta}_k^{(q)},\frac{q}{Q},\mathbf{r}_k\right)\right),\qquad q=0,\ldots,Q-1,
+```
+
+where each step rotates every pair and keeps the unit modulus. Two steps ($Q=2$) suffice, and the refined latent is decoded into the scene image and the target range, velocity, angle, and class.
+
+The full implementation lives in [`cosmic_main/`](cosmic_main).
 
 ---
 
