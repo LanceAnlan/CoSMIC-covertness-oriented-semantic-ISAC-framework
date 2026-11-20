@@ -35,9 +35,11 @@ class CovertISACConfig:
     rx_sigma_phi_min: float = 1e-4
     rx_sigma_phi_max: float = 4.0
 
-    # covert budget: sum chi(tau) <= 2*eps^2
+    # covert budget: 2*eps^2 nats over a monitoring window of K_W frames,
+    # every frame gets an equal share
     covert_eps: float = 0.10
     covert_delta_override: float = -1.0
+    covert_window_frames: int = 1000
     tau_proj_iters: int = 28
     tau_floor: float = 1e-8
 
@@ -50,7 +52,6 @@ class CovertISACConfig:
     tau_hidden: int = 128
     dec_use_rel: bool = True
     dec_use_slot_mask: bool = True
-    dec_rel_scale_base: float = 1.00
     dec_rel_scale_rf: float = 0.15
 
     # Bob-side classification head
@@ -87,18 +88,20 @@ class CovertISACConfig:
     rel_use_phi_resid: bool = True
     rel_use_logtau: bool = True
 
-    # RFlow refiner
-    rf_enable: bool = True
+    # RFlow refiner (rectified flow on the circle)
     rf_steps: int = 2
-    rf_ch: int = 96
-    rf_blocks: int = 4
-    rf_td: int = 96
-    rf_endpoint_weight: float = 0.12
+    rf_base_ch: int = 128
+    rf_ch_mult: Tuple[int, ...] = (1, 2, 2)
+    rf_res_blocks: int = 1
+    rf_attn_heads: int = 4
+    rf_time_dim: int = 128
+    rf_cond_dim: int = 256
+    rf_rel_ch: int = 64
     rf_gate_floor: float = 0.10
-    rf_train_steps: int = 5
-    rf_path_gamma: float = 1.00
-    rf_step_scale: float = 1.00
-    rf_step_loss_weight: float = 1.00
+    rf_vel_gate_floor: float = 0.05
+    rf_vmax: float = 1.5 * math.pi
+    rf_roll_weight: float = 0.25
+    rf_end_weight: float = 0.40
 
     # radar (ULA matched filter)
     radar_rx_ant: int = 8
@@ -141,6 +144,10 @@ class CovertISACConfig:
         if self.covert_delta_override is not None and self.covert_delta_override > 0.0:
             return float(self.covert_delta_override)
         return 2.0 * float(self.covert_eps) * float(self.covert_eps)
+
+    @property
+    def frame_budget(self) -> float:
+        return float(self.covert_delta) / float(max(1, int(self.covert_window_frames)))
 
     @property
     def sem_ch(self) -> int:
@@ -192,7 +199,9 @@ class CovertISACConfig:
             assert int(self.cls_slot_repeats) > 0
             assert int(self.num_classes) >= 2
             assert self.meta_slot_total + int(self.cls_slot_repeats) <= self.k_pairs
-        assert int(self.rf_train_steps) >= int(self.rf_steps)
+        assert int(self.covert_window_frames) >= 1
+        assert len(tuple(self.rf_ch_mult)) >= 1
+        assert int(self.rf_steps) >= 1
         assert self.radar_delay_max < self.spc
         assert self.radar_angle_grid >= 31
         assert int(self.radar_range_os) >= 1
@@ -233,45 +242,6 @@ class ConvNeXtLiteBlock(nn.Module):
         h = self.norm(h)
         h = self.pw2(self.act(self.pw1(h)))
         return x + self.gamma[:, None, None] * h
-
-
-class SinusoidalTimeEmbedding(nn.Module):
-    def __init__(self, dim: int) -> None:
-        super().__init__()
-        self.dim = int(dim)
-
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        half = self.dim // 2
-        freq = torch.exp(
-            -math.log(10000.0) * torch.arange(half, device=t.device, dtype=torch.float32) / max(half - 1, 1)
-        )
-        ang = t[:, None].float() * freq[None, :]
-        emb = torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)
-        if emb.shape[1] < self.dim:
-            emb = F.pad(emb, (0, self.dim - emb.shape[1]))
-        return emb
-
-
-class FlowBlock(nn.Module):
-    def __init__(self, ci: int, co: int, td: int) -> None:
-        super().__init__()
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(ci, co, 3, 1, 1, bias=False),
-            nn.GroupNorm(min(8, co), co),
-            nn.SiLU(),
-        )
-        self.time = nn.Sequential(nn.SiLU(), nn.Linear(td, co))
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(co, co, 3, 1, 1, bias=False),
-            nn.GroupNorm(min(8, co), co),
-            nn.SiLU(),
-        )
-        self.skip = nn.Conv2d(ci, co, 1) if ci != co else nn.Identity()
-
-    def forward(self, x: torch.Tensor, te: torch.Tensor) -> torch.Tensor:
-        h = self.conv1(x) + self.time(te)[:, :, None, None]
-        h = self.conv2(h)
-        return h + self.skip(x)
 
 
 # ================================================================
@@ -327,18 +297,31 @@ def cs_maps_to_theta(u_sem: torch.Tensor, cfg: CovertISACConfig) -> torch.Tensor
     return torch.atan2(s, c)
 
 
-def phase_delta_u(u_cur: torch.Tensor, u_base: torch.Tensor, cfg: CovertISACConfig) -> torch.Tensor:
-    theta_cur = cs_maps_to_theta(u_cur, cfg)
-    theta_base = cs_maps_to_theta(u_base, cfg)
-    return theta_to_u(wrap_phase(theta_cur - theta_base), cfg)
+# ================================================================
+# Covert projection: chi(t) = t - ln(t) - 1, keep sum chi(tau) <= 2*eps^2 / K_W per frame
+# ================================================================
+def chi64(tau: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    # float64, d - log1p(d) has no cancellation near tau = 1
+    d = torch.clamp(tau.double(), min=float(eps)) - 1.0
+    return d - torch.log1p(d)
 
 
-# ================================================================
-# Covert projection: chi(t) = t - ln(t) - 1, keep sum chi(tau) <= 2*eps^2
-# ================================================================
 def kl_g_tau(tau: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    tau = torch.clamp(tau, min=eps)
-    return tau - torch.log(tau) - 1.0
+    return chi64(tau, eps=eps)
+
+
+def _contract_tau(tau0: torch.Tensor, lam: torch.Tensor, eps: float) -> torch.Tensor:
+    # tau = 1 + lam*(tau0 - 1); lam = 0 gives exact ones, lam = 1 keeps tau0
+    lam_c = lam.reshape(-1, 1)
+    tau = torch.clamp(1.0 + lam_c * (tau0.double() - 1.0), min=float(eps)).to(tau0.dtype)
+    tau = torch.where(lam_c >= 1.0, tau0, tau)
+    return torch.where(lam_c <= 0.0, torch.ones_like(tau0), tau)
+
+
+def _frame_cost(tau: torch.Tensor, eps: float) -> torch.Tensor:
+    # cost of what is actually sent, the waveform uses amp = sqrt(tau) in float32
+    amp = torch.sqrt(torch.clamp(tau, min=float(eps))).float()
+    return chi64(amp.double() ** 2, eps=eps).sum(dim=1)
 
 
 def project_tau_budget_flat(
@@ -347,27 +330,25 @@ def project_tau_budget_flat(
     iters: int = 28,
     eps: float = 1e-12,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    # bisection on the contraction lambda: tau = 1 + lambda*(tau0 - 1)
+    # bisection on the contraction lambda, the largest one that fits the budget.
+    # lambda is a constant for autograd, so d tau / d tau0 = lambda
     B = tau0.shape[0]
-    g0 = kl_g_tau(tau0, eps=eps).sum(dim=1)
-    if float(torch.max(g0).item()) <= float(delta) + 1e-12:
-        return tau0, g0
-
-    lo = torch.zeros(B, 1, device=tau0.device, dtype=tau0.dtype)
-    hi = torch.ones(B, 1, device=tau0.device, dtype=tau0.dtype)
-    target = torch.full((B, 1), float(delta), device=tau0.device, dtype=tau0.dtype)
-
-    for _ in range(int(iters)):
-        mid = 0.5 * (lo + hi)
-        tau = torch.clamp(1.0 + mid * (tau0 - 1.0), min=eps)
-        g = kl_g_tau(tau, eps=eps).sum(dim=1, keepdim=True)
-        hi = torch.where(g > target, mid, hi)
-        lo = torch.where(g <= target, mid, lo)
-
-    lam = lo
-    tau = torch.clamp(1.0 + lam * (tau0 - 1.0), min=eps)
-    g = kl_g_tau(tau, eps=eps).sum(dim=1)
-    return tau, g
+    beta = torch.full((B,), float(delta), device=tau0.device, dtype=torch.float64)
+    with torch.no_grad():
+        t0 = tau0.detach()
+        lo = torch.zeros_like(beta)
+        hi = torch.ones_like(beta)
+        inside = _frame_cost(t0, eps) <= beta
+        for _ in range(int(iters)):
+            mid = 0.5 * (lo + hi)
+            fits = _frame_cost(_contract_tau(t0, mid, eps), eps) <= beta
+            lo = torch.where(fits, mid, lo)
+            hi = torch.where(fits, hi, mid)
+        lam = torch.where(inside, torch.ones_like(beta), lo)
+        if float(delta) <= 0.0:
+            lam = torch.zeros_like(beta)
+    tau = _contract_tau(tau0, lam, eps)
+    return tau, _frame_cost(tau, eps)
 
 
 def project_tau_budget_map(tau_raw_map: torch.Tensor, cfg: CovertISACConfig) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -375,7 +356,7 @@ def project_tau_budget_map(tau_raw_map: torch.Tensor, cfg: CovertISACConfig) -> 
     tau_flat = tau_raw_map.reshape(B, -1)
     tau_proj, kl = project_tau_budget_flat(
         tau_flat,
-        delta=cfg.covert_delta,
+        delta=cfg.frame_budget,
         iters=cfg.tau_proj_iters,
         eps=cfg.tau_floor,
     )
@@ -971,70 +952,202 @@ class SlotDomainRefiner(nn.Module):
         return out
 
 
-class SemanticFlowRefiner(nn.Module):
-    # RFlow velocity field, small UNet conditioned on time + reliability
-    def __init__(self, rel_ch: int, cfg: CovertISACConfig) -> None:
+def _gn(ch: int, max_groups: int = 32) -> nn.GroupNorm:
+    g = min(int(max_groups), int(ch))
+    while ch % g != 0:
+        g -= 1
+    return nn.GroupNorm(g, ch, eps=1e-6)
+
+
+def _zero(m: nn.Module) -> nn.Module:
+    for p in m.parameters():
+        nn.init.zeros_(p)
+    return m
+
+
+def _time_embedding(t: torch.Tensor, dim: int, scale: float = 1000.0) -> torch.Tensor:
+    half = dim // 2
+    freqs = torch.exp(-math.log(10000.0) * torch.arange(half, device=t.device, dtype=torch.float32) / max(half, 1))
+    ang = (t.float() * float(scale))[:, None] * freqs[None, :]
+    emb = torch.cat([torch.cos(ang), torch.sin(ang)], dim=-1)
+    if emb.shape[1] < dim:
+        emb = F.pad(emb, (0, dim - emb.shape[1]))
+    return emb
+
+
+class RFlowResBlock(nn.Module):
+    # GN-SiLU-conv, FiLM from time + global rel and from the spatial rel features, GN-SiLU-conv, skip
+    def __init__(self, cin: int, cout: int, cond_dim: int, rel_dim: int) -> None:
+        super().__init__()
+        self.norm1 = _gn(cin)
+        self.conv1 = nn.Conv2d(cin, cout, 3, 1, 1)
+        self.cond = nn.Linear(cond_dim, 2 * cout)
+        self.rel = _zero(nn.Conv2d(rel_dim, 2 * cout, 1)) if rel_dim > 0 else None
+        self.norm2 = _gn(cout)
+        self.conv2 = _zero(nn.Conv2d(cout, cout, 3, 1, 1))
+        self.skip = nn.Conv2d(cin, cout, 1) if cin != cout else nn.Identity()
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor, rfeat: Optional[torch.Tensor]) -> torch.Tensor:
+        h = self.conv1(F.silu(self.norm1(x)))
+        ss = self.cond(F.silu(cond))[:, :, None, None]
+        if self.rel is not None and rfeat is not None:
+            ss = ss + self.rel(rfeat)
+        scale, shift = ss.chunk(2, dim=1)
+        h = self.norm2(h) * (1.0 + scale) + shift
+        h = self.conv2(F.silu(h))
+        return self.skip(x) + h
+
+
+class RFlowAttnBlock(nn.Module):
+    def __init__(self, ch: int, heads: int) -> None:
+        super().__init__()
+        heads = max(1, int(heads))
+        while ch % heads != 0:
+            heads -= 1
+        self.heads = heads
+        self.norm = _gn(ch)
+        self.qkv = nn.Conv2d(ch, 3 * ch, 1)
+        self.proj = _zero(nn.Conv2d(ch, ch, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        d = C // self.heads
+        qkv = self.qkv(self.norm(x)).reshape(B, 3, self.heads, d, H * W).transpose(-1, -2)
+        q, k, v = qkv.unbind(dim=1)
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(-1, -2).reshape(B, C, H, W)
+        return x + self.proj(out)
+
+
+class RFlowNet(nn.Module):
+    # RFlow velocity field on the pair angles, UNet conditioned on time + reliability
+    def __init__(self, cfg: CovertISACConfig) -> None:
         super().__init__()
         self.cfg = cfg
-        td = int(cfg.rf_td)
-        ch = int(cfg.rf_ch)
-        in_ch = 3 * cfg.sem_ch + rel_ch + 1
-        self.temb = nn.Sequential(
-            SinusoidalTimeEmbedding(td),
-            nn.Linear(td, td),
-            nn.SiLU(),
-            nn.Linear(td, td),
-        )
-        self.e1 = FlowBlock(in_ch, ch, td)
-        self.d1 = nn.Conv2d(ch, ch, 4, 2, 1)
-        self.e2 = FlowBlock(ch, 2 * ch, td)
-        self.mid = FlowBlock(2 * ch, 2 * ch, td)
-        self.u1 = nn.ConvTranspose2d(2 * ch, ch, 4, 2, 1)
-        self.dec = FlowBlock(2 * ch, ch, td)
-        self.out_vel = nn.Conv2d(ch, cfg.pair_ch, 3, 1, 1)
-        self.out_gate = nn.Conv2d(ch, cfg.pair_ch, 3, 1, 1)
-        nn.init.zeros_(self.out_vel.weight)
-        nn.init.zeros_(self.out_gate.weight)
-        if self.out_vel.bias is not None:
-            nn.init.zeros_(self.out_vel.bias)
-        if self.out_gate.bias is not None:
-            nn.init.zeros_(self.out_gate.bias)
+        P = int(cfg.pair_ch)
+        self.P = P
+        self.rel_ch = int(cfg.rel_ch)
+        self.time_dim = int(cfg.rf_time_dim)
+        self.use_film = self.rel_ch > 0
+        cond = int(cfg.rf_cond_dim)
+        E = int(cfg.rf_rel_ch) if self.use_film else 0
+        cin = 2 * P + self.rel_ch + 1
+
+        self.t_mlp = nn.Sequential(nn.Linear(self.time_dim, cond), nn.SiLU(), nn.Linear(cond, cond))
+        if self.use_film:
+            self.rel_glob = nn.Sequential(nn.Linear(2 * self.rel_ch, cond), nn.SiLU(), _zero(nn.Linear(cond, cond)))
+            self.rel_enc0 = nn.Sequential(
+                nn.Conv2d(self.rel_ch + 1, E, 3, 1, 1), nn.SiLU(), nn.Conv2d(E, E, 3, 1, 1), nn.SiLU()
+            )
+        else:
+            self.rel_glob = None
+            self.rel_enc0 = None
+
+        chs = [int(cfg.rf_base_ch) * int(m) for m in cfg.rf_ch_mult]
+        self.chs = chs
+        nb = max(1, int(cfg.rf_res_blocks))
+        L = len(chs)
+        self.conv_in = nn.Conv2d(cin, chs[0], 3, 1, 1)
+
+        self.enc = nn.ModuleList()
+        self.down = nn.ModuleList()
+        self.rel_down = nn.ModuleList()
+        c_prev = chs[0]
+        for lvl in range(L):
+            blocks = nn.ModuleList()
+            for _ in range(nb):
+                blocks.append(RFlowResBlock(c_prev, chs[lvl], cond, E))
+                c_prev = chs[lvl]
+            self.enc.append(blocks)
+            if lvl < L - 1:
+                self.down.append(nn.Conv2d(c_prev, c_prev, 3, 2, 1))
+                if self.use_film:
+                    self.rel_down.append(nn.Sequential(nn.Conv2d(E, E, 3, 2, 1), nn.SiLU()))
+
+        cm = chs[-1]
+        self.mid1 = RFlowResBlock(cm, cm, cond, E)
+        self.mid_attn = RFlowAttnBlock(cm, cfg.rf_attn_heads)
+        self.mid2 = RFlowResBlock(cm, cm, cond, E)
+
+        self.dec = nn.ModuleList()
+        self.up = nn.ModuleList()
+        c_cur = cm
+        for lvl in reversed(range(L)):
+            blocks = nn.ModuleList()
+            blocks.append(RFlowResBlock(c_cur + chs[lvl], chs[lvl], cond, E))
+            for _ in range(nb - 1):
+                blocks.append(RFlowResBlock(chs[lvl], chs[lvl], cond, E))
+            self.dec.append(blocks)
+            c_cur = chs[lvl]
+            if lvl > 0:
+                self.up.append(nn.Conv2d(c_cur, chs[lvl - 1], 3, 1, 1))
+                c_cur = chs[lvl - 1]
+
+        # velocity (P) + gate logit (P), zero init
+        self.out_norm = _gn(chs[0])
+        self.out = _zero(nn.Conv2d(chs[0], 2 * P, 3, 1, 1))
+        self.gate_kappa = nn.Parameter(torch.tensor(0.0))
 
     def forward(
         self,
-        u_cur: torch.Tensor,
+        cs_t: torch.Tensor,
         t: torch.Tensor,
-        u_base: torch.Tensor,
         rel: torch.Tensor,
         slot_union: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        te = self.temb(t)
-        u_delta = phase_delta_u(u_cur, u_base, self.cfg)
-        inp = torch.cat([u_cur, u_base, u_delta, rel, slot_union], dim=1)
-        e1 = self.e1(inp, te)
-        e2 = self.e2(self.d1(e1), te)
-        m = self.mid(e2, te)
-        d = self.dec(torch.cat([self.u1(m), e1], dim=1), te)
-        return self.out_vel(d), self.out_gate(d)
+    ) -> torch.Tensor:
+        P = self.P
+        xs: List[torch.Tensor] = [cs_t.float()]
+        r_sq = torch.asinh(rel.float())
+        if self.rel_ch > 0:
+            xs.append(r_sq)
+        xs.append(slot_union.float())
+        x = torch.cat(xs, dim=1)
+
+        cond = self.t_mlp(_time_embedding(t, self.time_dim, 1000.0))
+        rfeats: List[Optional[torch.Tensor]] = [None] * len(self.chs)
+        if self.use_film:
+            stats = torch.cat([r_sq.mean(dim=(2, 3)), r_sq.std(dim=(2, 3))], dim=1)
+            cond = cond + self.rel_glob(stats)
+            r = self.rel_enc0(torch.cat([r_sq, slot_union.float()], dim=1))
+            rfeats[0] = r
+            for lvl in range(1, len(self.chs)):
+                r = self.rel_down[lvl - 1](r)
+                rfeats[lvl] = r
+
+        h = self.conv_in(x)
+        skips: List[torch.Tensor] = []
+        for lvl, blocks in enumerate(self.enc):
+            for blk in blocks:
+                h = blk(h, cond, rfeats[lvl])
+            skips.append(h)
+            if lvl < len(self.down):
+                h = self.down[lvl](h)
+        h = self.mid1(h, cond, rfeats[-1])
+        h = self.mid_attn(h)
+        h = self.mid2(h, cond, rfeats[-1])
+        L = len(self.chs)
+        for i, blocks in enumerate(self.dec):
+            lvl = L - 1 - i
+            h = torch.cat([h, skips[lvl]], dim=1)
+            for blk in blocks:
+                h = blk(h, cond, rfeats[lvl])
+            if lvl > 0:
+                h = F.interpolate(h, scale_factor=2.0, mode="nearest")
+                h = self.up[i](h)
+
+        # reliability gate, then a soft bound |v| < vmax
+        o = self.out(F.silu(self.out_norm(h))).float()
+        rho = torch.clamp(reliability_gate_from_rel(rel.float(), self.cfg), 1e-4, 1.0 - 1e-4)
+        logit_rho = torch.log(rho) - torch.log1p(-rho)
+        floor = float(self.cfg.rf_vel_gate_floor)
+        g = floor + (1.0 - floor) * torch.sigmoid(o[:, P:2 * P] + self.gate_kappa.float() * logit_rho)
+        vmax = float(self.cfg.rf_vmax)
+        return vmax * torch.tanh(g * o[:, :P] / vmax)
 
 
 # ================================================================
 # RFlow helpers
 # ================================================================
-def masked_mse(x: torch.Tensor, mask: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    num = torch.sum(mask * x * x)
-    den = torch.sum(mask) + eps
-    return num / den
-
-
-def non_slot_sem_mse(u_pred: torch.Tensor, u_true: torch.Tensor, cfg: CovertISACConfig) -> torch.Tensor:
-    theta_p = cs_maps_to_theta(u_pred, cfg)
-    theta_t = cs_maps_to_theta(u_true, cfg)
-    diff = wrap_phase(theta_p - theta_t)
-    keep = (~meta_slot_mask_map(cfg, u_pred.device)).float()
-    return masked_mse(diff, keep)
-
-
 def reliability_gate_from_rel(rel: torch.Tensor, cfg: CovertISACConfig) -> torch.Tensor:
     if rel.numel() == 0:
         return torch.ones(rel.shape[0], cfg.pair_ch, cfg.latent_h, cfg.latent_w, device=rel.device, dtype=rel.dtype)
@@ -1066,102 +1179,64 @@ def reliability_gate_from_rel(rel: torch.Tensor, cfg: CovertISACConfig) -> torch
     return torch.clamp(gate, min=floor, max=1.0)
 
 
-def _rf_progress_points(n_steps: int, gamma: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    n_steps = int(max(1, n_steps))
-    u = torch.linspace(0.0, 1.0, n_steps + 1, device=device, dtype=dtype)
-    gamma = float(max(1.0, gamma))
-    if abs(gamma - 1.0) < 1e-6:
-        p = u
-    else:
-        p = 1.0 - torch.pow(torch.clamp(1.0 - u, min=0.0), gamma)
-    p[0] = 0.0
-    p[-1] = 1.0
-    return p
+def _rf_masked_mean(x: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
+    k = keep.expand_as(x)
+    return (x * k).sum() / (k.sum() + 1e-8)
 
 
-def _masked_smooth_l1_phase(diff: torch.Tensor, mask: torch.Tensor, beta: float = 0.06, eps: float = 1e-8) -> torch.Tensor:
-    err = F.smooth_l1_loss(diff, torch.zeros_like(diff), beta=float(beta), reduction='none')
-    return torch.sum(err * mask) / (torch.sum(mask) + eps)
-
-
-def rf_refine_phase_eval(net: Optional[SemanticFlowRefiner], u_base: torch.Tensor, rel: torch.Tensor, cfg: CovertISACConfig, steps: int) -> torch.Tensor:
-    # Q-step ODE rollout on the phase; slots stay analytic, pairs stay on the unit circle
-    if net is None or int(steps) <= 0:
-        return u_base
-    theta0 = cs_maps_to_theta(u_base, cfg)
-    theta = theta0
+def rf_refine_circle(net: RFlowNet, u_base: torch.Tensor, rel: torch.Tensor, cfg: CovertISACConfig, steps: int) -> torch.Tensor:
+    # Q Euler steps on the circle, theta <- wrap(theta + v / Q); slots stay analytic
+    theta0 = cs_maps_to_theta(u_base.float(), cfg)
     slot_mask = meta_slot_mask_map(cfg, u_base.device)
     slot_union = slot_mask.any(dim=1, keepdim=True).float().expand(u_base.shape[0], -1, -1, -1)
-    rel_gate = reliability_gate_from_rel(rel, cfg)
-    n_steps = int(max(1, steps))
-    prog = _rf_progress_points(n_steps, float(getattr(cfg, 'rf_path_gamma', 1.00)), u_base.device, u_base.dtype)
-    step_scale = float(getattr(cfg, 'rf_step_scale', 1.00))
-    for k in range(n_steps):
-        dt = torch.clamp(prog[k + 1] - prog[k], min=1e-4)
-        t = torch.full((u_base.shape[0],), float(prog[k].item()), device=u_base.device, dtype=torch.float32)
-        u_cur = theta_to_u(theta, cfg)
-        vel_raw, gate_logit = net(u_cur, t, u_base, rel, slot_union)
-        step_gate = rel_gate * torch.sigmoid(gate_logit)
-        vel = step_gate * (math.pi * step_scale * torch.tanh(vel_raw))
-        theta_prop = wrap_phase(theta + dt * vel)
-        theta = torch.where(slot_mask, theta0, theta_prop)
+    Q = int(steps)
+    theta = theta0
+    for q in range(Q):
+        t = torch.full((u_base.shape[0],), float(q) / float(Q), device=u_base.device, dtype=torch.float32)
+        vel = net(theta_to_u(theta, cfg), t, rel.float(), slot_union)
+        theta = torch.where(slot_mask, theta0, wrap_phase(theta + vel / float(Q)))
     return theta_to_u(theta, cfg)
 
 
-def rf_semantic_train_objective(
-    net: Optional[SemanticFlowRefiner],
+def rf_flow_loss(
+    net: RFlowNet,
     u_base: torch.Tensor,
     rel: torch.Tensor,
     u_true: torch.Tensor,
     cfg: CovertISACConfig,
     steps: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    # flow matching: predicted velocity vs the straight-bridge target
-    if net is None or int(steps) <= 0:
-        z = torch.tensor(0.0, device=u_base.device)
-        return z, z
-
-    with torch.no_grad():
-        u0 = u_base.detach()
-        u1 = u_true.detach()
-        rel0 = rel.detach()
-
-    theta0 = cs_maps_to_theta(u0, cfg)
-    theta1 = cs_maps_to_theta(u1, cfg)
+    # flow matching on the geodesic bridge + rollout consistency along the Euler steps
+    theta0 = cs_maps_to_theta(u_base.detach().float(), cfg)
+    theta1 = cs_maps_to_theta(u_true.detach().float(), cfg)
+    rel0 = rel.detach().float()
     slot_mask = meta_slot_mask_map(cfg, u_base.device)
     keep = (~slot_mask).float()
     slot_union = slot_mask.any(dim=1, keepdim=True).float().expand(u_base.shape[0], -1, -1, -1)
-    rel_gate = reliability_gate_from_rel(rel0, cfg)
-    n_steps = int(max(1, steps))
-    prog = _rf_progress_points(n_steps, float(getattr(cfg, 'rf_path_gamma', 1.00)), u_base.device, u_base.dtype)
-    step_scale = float(getattr(cfg, 'rf_step_scale', 1.00))
+    B = theta0.shape[0]
+    delta = wrap_phase(theta1 - theta0)
 
-    theta_est = theta0
-    loss_vel = torch.tensor(0.0, device=u_base.device, dtype=u_base.dtype)
-    loss_roll = torch.tensor(0.0, device=u_base.device, dtype=u_base.dtype)
-    weights = torch.linspace(0.70, 1.00, n_steps, device=u_base.device, dtype=u_base.dtype)
-    weights = weights / torch.clamp(weights.sum(), min=1e-8)
+    # bridge theta_t = wrap(theta0 + t*delta), constant target velocity delta
+    t = torch.rand(B, device=u_base.device)
+    theta_t = torch.where(slot_mask, theta0, wrap_phase(theta0 + t[:, None, None, None] * delta))
+    vel = net(theta_to_u(theta_t, cfg), t, rel0, slot_union)
+    loss_fm = _rf_masked_mean((vel - delta) ** 2, keep)
 
-    for k in range(n_steps):
-        pk = prog[k]
-        dt = torch.clamp(prog[k + 1] - prog[k], min=1e-4)
-        t = torch.full((u_base.shape[0],), float(pk.item()), device=u_base.device, dtype=torch.float32)
-        u_cur = theta_to_u(theta_est, cfg)
-        vel_raw, gate_logit = net(u_cur, t, u0, rel0, slot_union)
-        step_gate = rel_gate * torch.sigmoid(gate_logit)
-        vel_pred = step_gate * (math.pi * step_scale * torch.tanh(vel_raw))
+    # at every state the Euler rollout visits, match the geodesic that reaches the clean latent at t = 1
+    Q = int(steps)
+    theta = theta0
+    loss_roll = torch.tensor(0.0, device=u_base.device)
+    for q in range(Q):
+        tq = float(q) / float(Q)
+        theta_in = theta.detach()
+        tt = torch.full((B,), tq, device=u_base.device, dtype=torch.float32)
+        vel = net(theta_to_u(theta_in, cfg), tt, rel0, slot_union)
+        target = wrap_phase(theta1 - theta_in) / (1.0 - tq)
+        loss_roll = loss_roll + _rf_masked_mean((vel - target) ** 2, keep) / float(Q)
+        theta = torch.where(slot_mask, theta0, wrap_phase(theta_in + vel / float(Q)))
+    endpoint = _rf_masked_mean(wrap_phase(theta - theta1) ** 2, keep)
 
-        remain = torch.clamp(1.0 - pk, min=1e-3)
-        vel_tgt = wrap_phase(theta1 - theta_est) / remain
-        diff_vel = wrap_phase(vel_pred - vel_tgt)
-        loss_vel = loss_vel + weights[k] * _masked_smooth_l1_phase(diff_vel, keep, beta=0.06)
-
-        theta_prop = wrap_phase(theta_est + dt * vel_pred)
-        theta_est = torch.where(slot_mask, theta0, theta_prop)
-        loss_roll = loss_roll + weights[k] * masked_mse(wrap_phase(theta_est - theta1), keep)
-
-    endpoint = masked_mse(wrap_phase(theta_est - theta1), keep)
-    loss = float(getattr(cfg, 'rf_step_loss_weight', 1.0)) * loss_vel + 0.35 * loss_roll + float(cfg.rf_endpoint_weight) * endpoint
+    loss = loss_fm + float(cfg.rf_roll_weight) * (loss_roll + float(cfg.rf_end_weight) * endpoint)
     return loss, endpoint
 
 
@@ -1564,8 +1639,8 @@ class CovertISACVoDSystem(nn.Module):
         self.tau_net = TauNetLite(self.encoder.feat_ch, cfg)
         self.decoder = SemanticDecoderLite(cfg.dec_in_ch, cfg)
         self.meta_head = MetaHeadAnalytic(cfg)
-        self.slot_refiner = SlotDomainRefiner(cfg) if cfg.rf_enable else None
-        self.rf_net = SemanticFlowRefiner(cfg.rel_ch, cfg) if cfg.rf_enable else None
+        self.slot_refiner = SlotDomainRefiner(cfg)
+        self.rf_net = RFlowNet(cfg)
         self.classifier = ClassifierHead(int(cfg.dec_in_ch), cfg) if getattr(cfg, "cls_enable", False) else None
         self.register_buffer("chirp", chirp_torch(cfg.spc, cfg.chirp_mu, torch.device("cpu")), persistent=False)
 
@@ -1596,6 +1671,8 @@ class CovertISACVoDSystem(nn.Module):
             "spc": int(self.cfg.spc),
             "k_pairs": int(self.cfg.k_pairs),
             "covert_delta": float(self.cfg.covert_delta),
+            "covert_window_frames": int(self.cfg.covert_window_frames),
+            "frame_budget": float(self.cfg.frame_budget),
             "rf_steps": int(self.cfg.rf_steps),
             "cls_enable": bool(getattr(self.cfg, "cls_enable", False)),
             "num_classes": int(getattr(self.cfg, "num_classes", 0)),
@@ -1635,7 +1712,6 @@ class CovertISACVoDSystem(nn.Module):
         h: torch.Tensor,
         nvar: torch.Tensor,
         b0: torch.Tensor,
-        rf_steps_override: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         chirp = self._chirp(y.device)
         u_sem, rel, tau_hat_map, den_map, slot_conf_map = bob_receive_features(y, h, nvar, b0, chirp, self.cfg)
@@ -1645,56 +1721,36 @@ class CovertISACVoDSystem(nn.Module):
         cls_slot_feat = None
         if bool(getattr(self.cfg, "cls_slot_enable", False)):
             cls_slot_mu, cls_slot_logits, cls_slot_feat = decode_cls_slots(u_sem, tau_hat_map, slot_conf_map, den_map, self.cfg)
-        internal_base = internal_ana
-        meta_base = self.meta_head.public_from_internal(internal_base)
-        dec_in_base = self._decoder_input(u_sem, rel, rel_scale=float(self.cfg.dec_rel_scale_base))
-        img_base = self.decoder(dec_in_base)
 
-        steps_eff = int(self.cfg.rf_steps if rf_steps_override is None else rf_steps_override)
-        if self.rf_net is not None and steps_eff > 0:
-            u_rf_non = rf_refine_phase_eval(self.rf_net, u_sem, rel, self.cfg, steps=steps_eff)
-            internal_rf = self.slot_refiner(internal_ana, slot_feat) if self.slot_refiner is not None else internal_ana
-            c_non = u_rf_non[:, :self.cfg.pair_ch]
-            s_non = u_rf_non[:, self.cfg.pair_ch: 2 * self.cfg.pair_ch]
-            c_rf, s_rf = inject_internal_slots(c_non, s_non, internal_rf, self.cfg)
-            if cls_slot_mu is not None:
-                c_rf, s_rf = inject_cls_slot_angle(c_rf, s_rf, cls_slot_mu, self.cfg)
-            c_rf, s_rf = normalize_cs(c_rf, s_rf)
-            u_rf = torch.cat([c_rf, s_rf], dim=1)
-            dec_in_rf = self._decoder_input(u_rf, rel, rel_scale=float(self.cfg.dec_rel_scale_rf))
-            img_rf = self.decoder(dec_in_rf)
-            meta_rf = self.meta_head.public_from_internal(internal_rf)
-        else:
-            internal_rf = internal_base
-            u_rf = u_sem
-            img_rf = img_base
-            dec_in_rf = dec_in_base
-            meta_rf = meta_base
-            steps_eff = 0
+        # RFlow on the image pairs, slot refiner on the protected slots, then decode
+        u_rf_non = rf_refine_circle(self.rf_net, u_sem, rel, self.cfg, steps=int(self.cfg.rf_steps))
+        internal_rf = self.slot_refiner(internal_ana, slot_feat)
+        c_non = u_rf_non[:, :self.cfg.pair_ch]
+        s_non = u_rf_non[:, self.cfg.pair_ch: 2 * self.cfg.pair_ch]
+        c_rf, s_rf = inject_internal_slots(c_non, s_non, internal_rf, self.cfg)
+        if cls_slot_mu is not None:
+            c_rf, s_rf = inject_cls_slot_angle(c_rf, s_rf, cls_slot_mu, self.cfg)
+        c_rf, s_rf = normalize_cs(c_rf, s_rf)
+        u_rf = torch.cat([c_rf, s_rf], dim=1)
+        dec_in_rf = self._decoder_input(u_rf, rel, rel_scale=float(self.cfg.dec_rel_scale_rf))
+        img_rf = self.decoder(dec_in_rf)
+        meta_rf = self.meta_head.public_from_internal(internal_rf)
 
         # classifier has its own branch on the recovered field, so its gradients
         # never touch the image decoder
         cls_logits = None
-        cls_logits_base = None
         cls_extra_rf = None
         if self.classifier is not None:
             cls_in_rf = dec_in_rf.detach() if bool(getattr(self.cfg, "cls_detach_feat", False)) else dec_in_rf
-            cls_in_base = dec_in_base.detach() if bool(getattr(self.cfg, "cls_detach_feat", False)) else dec_in_base
             parts_rf: List[torch.Tensor] = []
-            parts_base: List[torch.Tensor] = []
             if bool(self.cfg.cls_use_meta):
                 parts_rf.append(internal_rf.detach())
-                parts_base.append(internal_base.detach())
             if cls_slot_feat is not None:
                 parts_rf.append(cls_slot_feat.detach())
-                parts_base.append(cls_slot_feat.detach())
             cls_extra_rf = torch.cat(parts_rf, dim=1) if len(parts_rf) > 0 else None
-            cls_extra_base = torch.cat(parts_base, dim=1) if len(parts_base) > 0 else None
             cls_logits = self.classifier(cls_in_rf, cls_extra_rf)
-            cls_logits_base = self.classifier(cls_in_base, cls_extra_base)
             if cls_slot_logits is not None:
                 cls_logits = cls_logits + cls_slot_logits
-                cls_logits_base = cls_logits_base + cls_slot_logits
 
         return {
             "u_sem": u_sem,
@@ -1703,23 +1759,18 @@ class CovertISACVoDSystem(nn.Module):
             "den_map": den_map,
             "slot_conf_map": slot_conf_map,
             "slot_feat": slot_feat,
-            "internal_base": internal_base,
-            "img_base": img_base,
-            "meta_base": meta_base,
             "u_rf": u_rf,
             "internal_rf": internal_rf,
             "img_rf": img_rf,
             "meta_rf": meta_rf,
             "cls_logits": cls_logits,
-            "cls_logits_base": cls_logits_base,
             "cls_feat_rf": dec_in_rf,
             "cls_extra_rf": cls_extra_rf,
             "cls_slot_logits": cls_slot_logits,
-            "rf_steps_used": torch.tensor(float(steps_eff), device=y.device),
         }
 
     def rf_semantic_loss(self, u_base: torch.Tensor, rel: torch.Tensor, u_true: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        return rf_semantic_train_objective(self.rf_net, u_base, rel, u_true, self.cfg, steps=int(getattr(self.cfg, 'rf_train_steps', self.cfg.rf_steps)))
+        return rf_flow_loss(self.rf_net, u_base, rel, u_true, self.cfg, steps=int(self.cfg.rf_steps))
 
     def forward_batch(
         self,
@@ -1727,12 +1778,11 @@ class CovertISACVoDSystem(nn.Module):
         meta: torch.Tensor,
         snr_db: Any,
         channel_type: str = "rayleigh",
-        rf_steps_override: Optional[int] = None,
         cls_idx: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         tx = self.transmitter(img, meta, cls_idx=cls_idx)
         y, h, nvar = bob_channel(tx["x"], snr_db=snr_db, channel_type=channel_type)
-        rx = self.receiver(y, h, nvar, tx["b0"], rf_steps_override=rf_steps_override)
+        rx = self.receiver(y, h, nvar, tx["b0"])
         return {**tx, **rx, "y": y, "h": h, "nvar": nvar}
 
     @torch.no_grad()

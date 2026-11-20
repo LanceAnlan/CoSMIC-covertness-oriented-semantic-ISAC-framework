@@ -167,6 +167,8 @@ python main.py --mode train
 python main.py --mode test --snrs 0 5 10 15 20
 ```
 
+The covertness budget $\epsilon$ and the monitoring window $`K_{\mathrm{W}}`$ are set by `--eps` and `--window`, with defaults of `0.10` and `1000` frames.
+
 ---
 
 ## Citation

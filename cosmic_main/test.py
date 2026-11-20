@@ -56,6 +56,11 @@ def build_system_from_ckpt(ckpt: Dict[str, Any], cfg: Dict[str, Any], device: to
         valid = {f.name for f in fields(CovertISACConfig)}
         md = {k: v for k, v in dict(md).items() if k in valid}
         md.setdefault("cls_enable", False)
+        # budget flags on the command line win over the checkpoint
+        if cfg.get("covert_eps_cli", None) is not None:
+            md["covert_eps"] = float(cfg["covert_eps_cli"])
+        if cfg.get("covert_window_cli", None) is not None:
+            md["covert_window_frames"] = int(cfg["covert_window_cli"])
         model_cfg = CovertISACConfig(**md)
         model_cfg.check()
     model = CovertISACVoDSystem(model_cfg).to(device)
@@ -334,6 +339,7 @@ def test(cfg: Dict[str, Any]) -> None:
 
     ckpt = load_checkpoint(ckpt_path, map_location="cpu")
     model = build_system_from_ckpt(ckpt, cfg, device)
+    print(f"Covert budget: {model.cfg.covert_delta:.3e} nats over K_W={model.cfg.covert_window_frames} frames, {model.cfg.frame_budget:.3e} per frame (epsilon={model.cfg.covert_eps:.3f})")
 
     # use the class vocabulary the checkpoint was trained with
     ckpt_cfg = ckpt.get("cfg", {}) if isinstance(ckpt.get("cfg", {}), dict) else {}
@@ -401,8 +407,6 @@ def test(cfg: Dict[str, Any]) -> None:
             "vel_rmse_mps": m["rf_vel_rmse_mps"],
             "angle_rmse_deg": m["rf_angle_rmse_deg"],
             "cls_acc": m.get("rf_cls_acc", 0.0),
-            "psnr_no_rflow": m["base_psnr"],
-            "ssim_no_rflow": m["base_ssim"],
             "cert_kl": m["cert_kl"],
         }
         rows.append(row)

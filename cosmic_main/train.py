@@ -74,6 +74,7 @@ def build_model_cfg(cfg: Dict[str, Any]) -> CovertISACConfig:
         rx_sigma_phi_max=float(cfg["rx_sigma_phi_max"]),
         covert_eps=float(cfg["covert_eps"]),
         covert_delta_override=float(cfg.get("covert_delta_override", -1.0)),
+        covert_window_frames=int(cfg.get("covert_window_frames", 1000)),
         tau_proj_iters=int(cfg["tau_proj_iters"]),
         tau_floor=float(cfg["tau_floor"]),
         enc_base=int(cfg["enc_base"]),
@@ -85,7 +86,6 @@ def build_model_cfg(cfg: Dict[str, Any]) -> CovertISACConfig:
         tau_hidden=int(cfg["tau_hidden"]),
         dec_use_rel=bool(cfg.get("dec_use_rel", True)),
         dec_use_slot_mask=bool(cfg.get("dec_use_slot_mask", True)),
-        dec_rel_scale_base=float(cfg.get("dec_rel_scale_base", 1.00)),
         dec_rel_scale_rf=float(cfg.get("dec_rel_scale_rf", 0.15)),
         cls_enable=bool(cfg.get("cls_enable", True)),
         num_classes=int(cfg.get("num_classes", len(VOD_DEFAULT_CLASSES))),
@@ -116,17 +116,18 @@ def build_model_cfg(cfg: Dict[str, Any]) -> CovertISACConfig:
         rel_use_logsnr=bool(cfg["rel_use_logsnr"]),
         rel_use_phi_resid=bool(cfg["rel_use_phi_resid"]),
         rel_use_logtau=bool(cfg["rel_use_logtau"]),
-        rf_enable=bool(cfg["rf_enable"]),
         rf_steps=int(cfg["rf_steps"]),
-        rf_ch=int(cfg["rf_ch"]),
-        rf_blocks=int(cfg["rf_blocks"]),
-        rf_td=int(cfg.get("rf_td", 96)),
-        rf_endpoint_weight=float(cfg.get("rf_endpoint_weight", 0.12)),
+        rf_base_ch=int(cfg.get("rf_base_ch", 128)),
+        rf_ch_mult=tuple(int(x) for x in cfg.get("rf_ch_mult", (1, 2, 2))),
+        rf_res_blocks=int(cfg.get("rf_res_blocks", 1)),
+        rf_attn_heads=int(cfg.get("rf_attn_heads", 4)),
+        rf_time_dim=int(cfg.get("rf_time_dim", 128)),
+        rf_cond_dim=int(cfg.get("rf_cond_dim", 256)),
+        rf_rel_ch=int(cfg.get("rf_rel_ch", 64)),
         rf_gate_floor=float(cfg.get("rf_gate_floor", 0.10)),
-        rf_train_steps=int(cfg.get("rf_train_steps", max(int(cfg.get("rf_steps", 2)), 5))),
-        rf_path_gamma=float(cfg.get("rf_path_gamma", 1.00)),
-        rf_step_scale=float(cfg.get("rf_step_scale", 1.00)),
-        rf_step_loss_weight=float(cfg.get("rf_step_loss_weight", 1.00)),
+        rf_vel_gate_floor=float(cfg.get("rf_vel_gate_floor", 0.05)),
+        rf_roll_weight=float(cfg.get("rf_roll_weight", 0.25)),
+        rf_end_weight=float(cfg.get("rf_end_weight", 0.40)),
         radar_rx_ant=int(cfg["radar_rx_ant"]),
         radar_angle_max_deg=float(cfg["radar_angle_max_deg"]),
         radar_angle_grid=int(cfg["radar_angle_grid"]),
@@ -403,7 +404,6 @@ def evaluate(
     cfg: Dict[str, Any],
     max_batches: Optional[int] = None,
     desc: str = "Eval",
-    rf_steps_override: Optional[int] = None,
 ) -> Dict[str, float]:
     model.eval()
     weights = torch.tensor(cfg["meta_loss_weights"], device=device, dtype=torch.float32)
@@ -422,42 +422,29 @@ def evaluate(
             img_wh = batch["img_wh"].to(device) if "img_wh" in batch else None
             cls_idx = batch["cls_idx"].to(device) if "cls_idx" in batch else None
 
-            out = model.forward_batch(img, meta, snr_db=snr_db, channel_type=bob_channel_type, rf_steps_override=rf_steps_override, cls_idx=cls_idx)
+            out = model.forward_batch(img, meta, snr_db=snr_db, channel_type=bob_channel_type, cls_idx=cls_idx)
             acc_rf = classification_acc(out.get("cls_logits"), cls_idx) if cls_idx is not None else 0.0
-            acc_base = classification_acc(out.get("cls_logits_base"), cls_idx) if cls_idx is not None else 0.0
 
-            loss_img_base, _ = image_loss(out["img_base"], img, mask, cfg)
             loss_img_rf, _ = image_loss(out["img_rf"], img, mask, cfg)
-            loss_meta_base = weighted_meta_rmse(out["meta_base"], meta, weights)
             loss_meta_rf = weighted_meta_rmse(out["meta_rf"], meta, weights)
-            if model.rf_net is not None:
-                loss_rf, loss_rf_sem = refinement_objective(model, out)
-            else:
-                z = torch.tensor(0.0, device=device)
-                loss_rf, loss_rf_sem = z, z
+            loss_rf, loss_rf_sem = refinement_objective(model, out)
             total = (
                 loss_img_rf
                 + float(cfg["lambda_meta"]) * weighted_meta_loss_public(out["meta_rf"], meta, weights)
                 + float(cfg["lambda_rf"]) * loss_rf
-                + float(cfg.get("base_loss_weight", 0.0)) * loss_img_base
             )
 
-            mb = compute_metrics_single_pred(img, out["img_base"], meta, out["meta_base"], mask, img_wh, cfg)
             mr = compute_metrics_single_pred(img, out["img_rf"], meta, out["meta_rf"], mask, img_wh, cfg)
 
             vals = {
                 "loss": float(total.item()),
-                "loss_img_base": float(loss_img_base.item()),
                 "loss_img_rf": float(loss_img_rf.item()),
-                "loss_meta_base": float(loss_meta_base.item()),
                 "loss_meta_rf": float(loss_meta_rf.item()),
                 "loss_rf_sem": float(loss_rf_sem.item()),
                 "loss_rf_total": float(loss_rf.item()),
                 "cert_kl": float(out["kl"].mean().item()),
                 "tau_mean": float(out["tau_map"].mean().item()),
-                "base_cls_acc": float(acc_base),
                 "rf_cls_acc": float(acc_rf),
-                **{f"base_{k}": float(v) for k, v in mb.items()},
                 **{f"rf_{k}": float(v) for k, v in mr.items()},
             }
             for k, v in vals.items():
@@ -494,7 +481,6 @@ def evaluate_multi_snr(
     cfg: Dict[str, Any],
     max_batches: Optional[int] = None,
     desc_prefix: str = "Eval",
-    rf_steps_override: Optional[int] = None,
 ) -> Tuple[Dict[str, float], List[Dict[str, float]]]:
     rows: List[Dict[str, float]] = []
     for snr_db in snr_list:
@@ -507,7 +493,6 @@ def evaluate_multi_snr(
             cfg=cfg,
             max_batches=max_batches,
             desc=f"{desc_prefix}@{snr_db}dB",
-            rf_steps_override=rf_steps_override,
         )
         row["snr_db"] = float(snr_db)
         rows.append(row)
@@ -531,7 +516,6 @@ def plot_history(history: List[Dict[str, float]], out_dir: str) -> None:
     axes[0].plot(epochs, series("train_loss"), "-o", ms=3, label="train loss")
     axes[0].set_xlabel("epoch"); axes[0].set_ylabel("loss"); axes[0].grid(alpha=0.3); axes[0].legend()
     axes[1].plot(epochs, series("val_rf_psnr"), "-o", ms=3, label="val PSNR")
-    axes[1].plot(epochs, series("val_base_psnr"), "--s", ms=3, label="val PSNR (no RFlow)")
     axes[1].set_xlabel("epoch"); axes[1].set_ylabel("PSNR (dB)"); axes[1].grid(alpha=0.3); axes[1].legend()
     axes[2].plot(epochs, series("val_rf_meta_rmse"), "-o", ms=3, label="val meta RMSE")
     axes[2].plot(epochs, series("val_rf_cls_acc"), "--s", ms=3, label="val cls acc")
@@ -673,7 +657,7 @@ def train(cfg: Dict[str, Any]) -> None:
     print("Model info:", model.model_info())
     print(f"Train samples: {len(train_set)} | Val samples: {len(val_set)}")
     print(f"Bob channel: {cfg['bob_channel_type']} | Train SNRs: {train_snr_list} | Val SNRs: {val_snr_list}")
-    print(f"Covert budget: KL <= {model.cfg.covert_delta:.3e} (epsilon={model.cfg.covert_eps:.3f})")
+    print(f"Covert budget: {model.cfg.covert_delta:.3e} nats over K_W={model.cfg.covert_window_frames} frames, {model.cfg.frame_budget:.3e} per frame (epsilon={model.cfg.covert_eps:.3f})")
 
     best_score = -1e18
     history: List[Dict[str, float]] = []
@@ -699,13 +683,9 @@ def train(cfg: Dict[str, Any]) -> None:
             batch_snr = _sample_train_snr(train_snr_list, train_snr_probs, mode=str(cfg.get("train_snr_sampling", "uniform")))
             out = model.forward_batch(img, meta, snr_db=batch_snr, channel_type=str(cfg["bob_channel_type"]), cls_idx=cls_idx)
 
-            loss_img_base, _ = image_loss(out["img_base"], img, mask, cfg)
             loss_img_rf, _ = image_loss(out["img_rf"], img, mask, cfg)
             loss_meta_phys = meta_phys_loss(out["meta_rf"], meta, cfg)
-            if model.rf_net is not None:
-                loss_rf, _ = refinement_objective(model, out)
-            else:
-                loss_rf = torch.tensor(0.0, device=device)
+            loss_rf, _ = refinement_objective(model, out)
 
             ls = float(cfg.get("cls_label_smoothing", 0.05))
             mixup_alpha = float(cfg.get("cls_mixup_alpha", 0.0))
@@ -718,12 +698,10 @@ def train(cfg: Dict[str, Any]) -> None:
                     z = model.classifier.pooled(out["cls_feat_rf"], out.get("cls_extra_rf"))
                     z_mix = lam * z + (1.0 - lam) * z[perm]
                     logits_mix = model.classifier.classify_pooled(z_mix)
-                    loss_cls_rf = (lam * classification_loss(logits_mix, cls_idx, class_weights, ls)
-                                   + (1.0 - lam) * classification_loss(logits_mix, cls_idx[perm], class_weights, ls))
+                    loss_cls = (lam * classification_loss(logits_mix, cls_idx, class_weights, ls)
+                                + (1.0 - lam) * classification_loss(logits_mix, cls_idx[perm], class_weights, ls))
                 else:
-                    loss_cls_rf = classification_loss(out["cls_logits"], cls_idx, class_weights, ls)
-                loss_cls_base = classification_loss(out.get("cls_logits_base"), cls_idx, class_weights, ls)
-                loss_cls = loss_cls_rf + float(cfg.get("cls_aux_base_weight", 0.3)) * loss_cls_base
+                    loss_cls = classification_loss(out["cls_logits"], cls_idx, class_weights, ls)
             else:
                 loss_cls = torch.tensor(0.0, device=device)
                 acc_rf = 0.0
@@ -733,7 +711,6 @@ def train(cfg: Dict[str, Any]) -> None:
                 + float(cfg["lambda_meta"]) * weighted_meta_loss_public(out["meta_rf"], meta, meta_weights)
                 + float(cfg.get("lambda_meta_phys", 0.4)) * loss_meta_phys
                 + float(cfg["lambda_rf"]) * loss_rf
-                + float(cfg.get("base_loss_weight", 0.0)) * loss_img_base
                 + float(cfg.get("lambda_cls", 0.7)) * loss_cls
             )
             loss_value = float(loss.item())
@@ -797,7 +774,6 @@ def train(cfg: Dict[str, Any]) -> None:
             "train_loss": train_summary["loss"],
             "train_psnr": train_summary["psnr"],
             "train_cls_acc": train_summary["cls_acc"],
-            "val_base_psnr": val_agg.get("base_psnr", 0.0),
             "val_rf_psnr": val_agg.get("rf_psnr", 0.0),
             "val_rf_ssim": val_agg.get("rf_ssim", 0.0),
             "val_rf_meta_rmse": val_agg.get("rf_meta_rmse", 0.0),
@@ -810,7 +786,7 @@ def train(cfg: Dict[str, Any]) -> None:
 
         print(
             f"[Epoch {epoch}] loss={train_summary['loss']:.5f} | "
-            f"val PSNR={val_agg.get('base_psnr', 0.0):.3f}/{val_agg.get('rf_psnr', 0.0):.3f} dB (no-RF/RF) | "
+            f"val PSNR={val_agg.get('rf_psnr', 0.0):.3f} dB | "
             f"SSIM={val_agg.get('rf_ssim', 0.0):.4f} | metaRMSE={val_agg.get('rf_meta_rmse', 0.0):.4f} | "
             f"clsAcc={val_agg.get('rf_cls_acc', 0.0):.3f} | KL={val_agg.get('cert_kl', 0.0):.3e} | "
             f"joint={val_agg.get('joint_score', -1e18):.4f}"

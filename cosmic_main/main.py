@@ -73,7 +73,6 @@ def build_default_config() -> Dict[str, Any]:
         "lambda_cls": 0.70,
         "cls_lr_mult": 1.0,
         "cls_weight_decay": 1e-3,
-        "cls_aux_base_weight": 0.30,
         "cls_label_smoothing": 0.10,
         "cls_use_class_weights": False,
         "cls_weight_power": 0.50,
@@ -89,6 +88,7 @@ def build_default_config() -> Dict[str, Any]:
         "alpha": 0.26,
         "ar_rho": 0.0,
         "covert_eps": 0.10,
+        "covert_window_frames": 1000,          # K_W, each frame gets 2*eps^2 / K_W
         "covert_delta_override": -1.0,
         "tau_proj_iters": 28,
         "tau_floor": 1e-8,
@@ -110,7 +110,6 @@ def build_default_config() -> Dict[str, Any]:
         "tau_hidden": 128,
         "dec_use_rel": True,
         "dec_use_slot_mask": True,
-        "dec_rel_scale_base": 1.00,
         "dec_rel_scale_rf": 0.12,
 
         # protected meta slots
@@ -130,17 +129,18 @@ def build_default_config() -> Dict[str, Any]:
         "rel_use_logtau": True,
 
         # RFlow refiner
-        "rf_enable": True,
         "rf_steps": 2,
-        "rf_ch": 96,
-        "rf_blocks": 4,
-        "rf_td": 96,
-        "rf_train_steps": 5,
-        "rf_path_gamma": 1.00,
-        "rf_step_scale": 1.00,
-        "rf_step_loss_weight": 1.00,
-        "rf_endpoint_weight": 0.12,
+        "rf_base_ch": 128,
+        "rf_ch_mult": [1, 2, 2],
+        "rf_res_blocks": 1,
+        "rf_attn_heads": 4,
+        "rf_time_dim": 128,
+        "rf_cond_dim": 256,
+        "rf_rel_ch": 64,
         "rf_gate_floor": 0.10,
+        "rf_vel_gate_floor": 0.05,
+        "rf_roll_weight": 0.25,
+        "rf_end_weight": 0.40,
         "slot_refine_hidden": 256,
         "slot_refine_scale": 0.14,
 
@@ -164,7 +164,6 @@ def build_default_config() -> Dict[str, Any]:
         "phys_vel_weight": 1.0,
         "phys_angle_weight": 1.0,
         "lambda_rf": 0.36,
-        "base_loss_weight": 0.01,
         "meta_loss_weights": [1.4, 2.4, 2.8, 2.8, 0.65, 0.65, 0.40, 0.40],
         "model_select_meta_weight": 4.0,
 
@@ -232,6 +231,8 @@ def finalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError(f"mode must be 'train' or 'test', got {cfg['mode']}")
     if cfg["bob_channel_type"] not in ["rayleigh", "awgn"]:
         raise ValueError(f"bob_channel_type must be 'rayleigh' or 'awgn', got {cfg['bob_channel_type']}")
+    if int(cfg["covert_window_frames"]) < 1:
+        raise ValueError(f"covert_window_frames must be >= 1, got {cfg['covert_window_frames']}")
 
     reps = cfg.get("meta_slot_repeats", None)
     if reps is None or len(reps) != 8:
@@ -268,6 +269,8 @@ def parse_args_into(cfg: Dict[str, Any]) -> Dict[str, Any]:
     p.add_argument("--ckpt", type=str, default=None, help="checkpoint for test mode")
     p.add_argument("--demo", type=int, default=cfg["num_demo_sequences"], help="number of demo sequences to save in test mode")
     p.add_argument("--demo-snr", type=float, default=cfg["demo_snr_db"])
+    p.add_argument("--eps", type=float, default=None, help="covert epsilon, budget 2*eps^2 nats per window")
+    p.add_argument("--window", type=int, default=None, help="monitoring window K_W in frames")
     args = p.parse_args()
 
     cfg["mode"] = args.mode
@@ -282,6 +285,12 @@ def parse_args_into(cfg: Dict[str, Any]) -> Dict[str, Any]:
         cfg["test_ckpt_path"] = args.ckpt
     cfg["num_demo_sequences"] = int(args.demo)
     cfg["demo_snr_db"] = float(args.demo_snr)
+    if args.eps is not None:
+        cfg["covert_eps"] = float(args.eps)
+    if args.window is not None:
+        cfg["covert_window_frames"] = int(args.window)
+    cfg["covert_eps_cli"] = args.eps
+    cfg["covert_window_cli"] = args.window
     return cfg
 
 
@@ -294,7 +303,7 @@ if __name__ == "__main__":
     print("=" * 60)
     print("CoSMIC | covert semantic ISAC")
     print(f"mode={cfg['mode']} exp={cfg['exp_name']} device={cfg['device']}")
-    print(f"channel={cfg['bob_channel_type']} eps={cfg['covert_eps']} test_snrs={cfg['test_snr_dbs']}")
+    print(f"channel={cfg['bob_channel_type']} eps={cfg['covert_eps']} K_W={cfg['covert_window_frames']} test_snrs={cfg['test_snr_dbs']}")
     print("=" * 60)
 
     if cfg["mode"] == "train":
